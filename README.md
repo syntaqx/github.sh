@@ -6,7 +6,7 @@ repositories without having to clone each one individually, and for ensuring
 that all repositories are up-to-date.
 
 The way I use this script is because all of my repositories are cloned into the
-base directory of `~/Code/<organization|username>`. This sits in the
+base directory of `~/Code/<org|username>`. This sits in the
 `~/Code` directory, and I can easily update any organization or user's
 repositories by running this script.
 
@@ -21,5 +21,5 @@ repositories by running this script.
 ## Usage
 
 ```bash
-./github.sh <organization>
+./github.sh <organization|username>
 ```
