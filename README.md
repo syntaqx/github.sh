@@ -1,4 +1,4 @@
-# github.sh - A way to clone and update an organization's repositories
+# `github.sh` - Fetch and update all organization/user repositories
 
 A simple helper script to clone and update all repositories of a GitHub
 organization. This is useful for developers who want to work with multiple
