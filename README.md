@@ -12,6 +12,7 @@ repositories by running this script.
 
 ## Prerequisites
 
+- A `GITHUB_TOKEN` for usage on the API to retrieve all repositories
 - `git` must be installed on your system.
 - `jq` must be installed on your system for JSON parsing.
 - `curl` must be installed on your system for making HTTP requests.
