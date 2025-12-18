@@ -24,8 +24,20 @@ PAGE=1
 PER_PAGE=100
 ORG_DIR=$ORG
 TOTAL_REPOS=0
+SKIPPED_REPOS=0
 # Maximum number of parallel jobs (can be overridden by setting MAX_PARALLEL_JOBS environment variable)
 MAX_PARALLEL_JOBS=${MAX_PARALLEL_JOBS:-5}
+# Array to track failed repositories
+declare -a FAILED_REPOS
+FAILED_REPOS_FILE="/tmp/github_failed_repos_$$.tmp"
+
+# Repositories to ignore (add repository names here)
+declare -a IGNORE_LIST=(
+  "customer-portal-deprecated"
+  "sdk-js-legacy"
+  "legacy-ops-traefik"
+  "ops-seeder"
+)
 
 # Create organization directory if it doesn't exist
 mkdir -p "$ORG_DIR"
@@ -38,6 +50,17 @@ echo "Using up to $MAX_PARALLEL_JOBS parallel jobs"
 # Function to fetch repositories from the GitHub API
 fetch_repositories() {
   curl -s -H "Authorization: token $GITHUB_TOKEN" "$GITHUB_API_URL/orgs/$ORG/repos?per_page=$PER_PAGE&page=$PAGE"
+}
+
+# Function to check if a repository should be ignored
+should_ignore() {
+  local repo_name=$1
+  for ignored in "${IGNORE_LIST[@]}"; do
+    if [[ "$repo_name" == "$ignored" ]]; then
+      return 0  # true, should ignore
+    fi
+  done
+  return 1  # false, should not ignore
 }
 
 # Function to ensure remote is using SSH
@@ -75,27 +98,48 @@ process_repository() {
     ensure_ssh_remote
 
     # Checkout main branch before pulling
+    local pull_status=0
     if [ "$VERBOSE" = true ]; then
       echo "Checking out main branch for $REPO_DIR..."
       git checkout main 2>/dev/null || git checkout master 2>/dev/null || echo "Warning: Could not checkout main/master branch for $REPO_DIR"
       git remote -v
       git pull
+      pull_status=$?
     else
       git checkout main 2>/dev/null || git checkout master 2>/dev/null
       git pull --quiet
+      pull_status=$?
     fi
     cd .. || { echo "Failed to change back to parent directory"; return 1; }
+
+    # Check if pull failed
+    if [ $pull_status -ne 0 ]; then
+      echo "ERROR: Failed to pull $REPO_DIR (exit code: $pull_status)"
+      echo "$REPO_DIR:$pull_status" >> "$FAILED_REPOS_FILE"
+      return 1
+    fi
   else
     echo "Cloning repository $REPO_DIR..."
+    local clone_status=0
     if [ "$VERBOSE" = true ]; then
       git clone "$REPO"
+      clone_status=$?
     else
       git clone --quiet "$REPO"
+      clone_status=$?
+    fi
+
+    # Check if clone failed
+    if [ $clone_status -ne 0 ]; then
+      echo "ERROR: Failed to clone $REPO_DIR (exit code: $clone_status)"
+      echo "$REPO_DIR:$clone_status" >> "$FAILED_REPOS_FILE"
+      return 1
     fi
   fi
 
   # Signal completion
   echo "Completed processing $REPO_DIR"
+  return 0
 }
 
 # Function to wait for background jobs to complete
@@ -122,6 +166,16 @@ while true; do
   fi
 
   for REPO in $REPO_NAMES; do
+    # Get repository name
+    repo_name=$(basename "$REPO" .git)
+
+    # Check if repository should be ignored
+    if should_ignore "$repo_name"; then
+      echo "⏭️  Skipping ignored repository: $repo_name"
+      SKIPPED_REPOS=$((SKIPPED_REPOS + 1))
+      continue
+    fi
+
     # Wait if we've reached the maximum number of parallel jobs
     wait_for_jobs $MAX_PARALLEL_JOBS
 
@@ -138,6 +192,30 @@ done
 echo "Waiting for all repositories to finish processing..."
 wait
 
+# Check for any failures
+if [ -f "$FAILED_REPOS_FILE" ]; then
+  while IFS=: read -r repo_name exit_code; do
+    FAILED_REPOS+=("$repo_name (exit code: $exit_code)")
+  done < "$FAILED_REPOS_FILE"
+  rm -f "$FAILED_REPOS_FILE"
+fi
+
 echo "-----------------------------------------"
 echo "All repositories have been cloned or updated."
-echo "Total number of repositories in the organization: $TOTAL_REPOS"
+echo "Total repositories processed: $TOTAL_REPOS"
+if [ $SKIPPED_REPOS -gt 0 ]; then
+  echo "Skipped repositories (ignored): $SKIPPED_REPOS"
+fi
+
+# Report any failures
+if [ ${#FAILED_REPOS[@]} -gt 0 ]; then
+  echo ""
+  echo "⚠️  WARNING: ${#FAILED_REPOS[@]} repository/repositories encountered errors:"
+  for failed in "${FAILED_REPOS[@]}"; do
+    echo "  ❌ $failed"
+  done
+  echo ""
+  echo "Please manually fix the repositories listed above."
+else
+  echo "✅ All repositories processed successfully."
+fi
