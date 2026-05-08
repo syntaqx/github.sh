@@ -25,11 +25,12 @@ PER_PAGE=100
 ORG_DIR=$ORG
 TOTAL_REPOS=0
 SKIPPED_REPOS=0
-# Maximum number of parallel jobs (can be overridden by setting MAX_PARALLEL_JOBS environment variable)
+SYNCED_REPOS=0
+CLONED_REPOS=0
 MAX_PARALLEL_JOBS=${MAX_PARALLEL_JOBS:-5}
-# Array to track failed repositories
 declare -a FAILED_REPOS
 FAILED_REPOS_FILE="/tmp/github_failed_repos_$$.tmp"
+SUCCESS_FILE="/tmp/github_success_$$.tmp"
 
 # Repositories to ignore (add repository names here)
 declare -a IGNORE_LIST=(
@@ -43,9 +44,8 @@ declare -a IGNORE_LIST=(
 mkdir -p "$ORG_DIR"
 cd "$ORG_DIR" || { echo "Failed to change directory to $ORG_DIR"; exit 1; }
 
-# Output organization clone directory
-echo "Cloning repositories to: $(realpath "$PWD")"
-echo "Using up to $MAX_PARALLEL_JOBS parallel jobs"
+echo "⟳  Syncing $ORG → $(realpath "$PWD")"
+echo ""
 
 # Function to fetch repositories from the GitHub API
 fetch_repositories() {
@@ -57,30 +57,19 @@ should_ignore() {
   local repo_name=$1
   for ignored in "${IGNORE_LIST[@]}"; do
     if [[ "$repo_name" == "$ignored" ]]; then
-      return 0  # true, should ignore
+      return 0
     fi
   done
-  return 1  # false, should not ignore
+  return 1
 }
 
 # Function to ensure remote is using SSH
 ensure_ssh_remote() {
-  # Get the current remote URL
   local remote_url
   remote_url=$(git remote get-url origin)
-
-  # Check if it's an HTTPS URL
   if [[ $remote_url == https://github.com/* ]]; then
-    # Convert HTTPS URL to SSH URL
     local ssh_url="git@github.com:${remote_url#https://github.com/}"
-
-    # Update the remote URL
-    if [ "$VERBOSE" = true ]; then
-      echo "Converting remote from HTTPS to SSH: $remote_url → $ssh_url"
-      git remote set-url origin "$ssh_url"
-    else
-      git remote set-url origin "$ssh_url" &> /dev/null
-    fi
+    git remote set-url origin "$ssh_url" &> /dev/null
   fi
 }
 
@@ -92,53 +81,56 @@ process_repository() {
   REPO_DIR="${REPO_DIR%.git}"
 
   if [ -d "$REPO_DIR" ]; then
-    echo "Directory $REPO_DIR exists. Pulling latest changes..."
-    cd "$REPO_DIR" || { echo "Failed to change directory to $REPO_DIR"; return 1; }
-    # Ensure remote is using SSH before pulling
+    cd "$REPO_DIR" || return 1
     ensure_ssh_remote
 
-    # Checkout main branch before pulling
-    local pull_status=0
-    if [ "$VERBOSE" = true ]; then
-      echo "Checking out main branch for $REPO_DIR..."
-      git checkout main 2>/dev/null || git checkout master 2>/dev/null || echo "Warning: Could not checkout main/master branch for $REPO_DIR"
-      git remote -v
-      git pull
-      pull_status=$?
-    else
-      git checkout main 2>/dev/null || git checkout master 2>/dev/null
-      git pull --quiet
-      pull_status=$?
+    # Detect dirty working tree
+    local dirty=false
+    if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+      dirty=true
     fi
-    cd .. || { echo "Failed to change back to parent directory"; return 1; }
 
-    # Check if pull failed
+    # Checkout main/master
+    local branch
+    branch=$(git checkout main 2>/dev/null && echo "main" || (git checkout master 2>/dev/null && echo "master"))
+
+    # Pull
+    local output pull_status
+    output=$(git pull --quiet 2>&1)
+    pull_status=$?
+    cd ..
+
     if [ $pull_status -ne 0 ]; then
-      echo "ERROR: Failed to pull $REPO_DIR (exit code: $pull_status)"
-      echo "$REPO_DIR:$pull_status" >> "$FAILED_REPOS_FILE"
+      local reason="unknown"
+      if [ "$dirty" = true ]; then
+        reason="dirty"
+      elif echo "$output" | grep -q "unrelated histories"; then
+        reason="diverged"
+      elif echo "$output" | grep -q "no such ref"; then
+        reason="missing-ref"
+      fi
+      echo "  ✗ $REPO_DIR"
+      echo "$REPO_DIR:$pull_status:$reason" >> "$FAILED_REPOS_FILE"
       return 1
-    fi
-  else
-    echo "Cloning repository $REPO_DIR..."
-    local clone_status=0
-    if [ "$VERBOSE" = true ]; then
-      git clone "$REPO"
-      clone_status=$?
-    else
-      git clone --quiet "$REPO"
-      clone_status=$?
     fi
 
-    # Check if clone failed
+    echo "  ✓ $REPO_DIR"
+    echo "pull" >> "$SUCCESS_FILE"
+  else
+    local output clone_status
+    output=$(git clone --quiet "$REPO" 2>&1)
+    clone_status=$?
+
     if [ $clone_status -ne 0 ]; then
-      echo "ERROR: Failed to clone $REPO_DIR (exit code: $clone_status)"
-      echo "$REPO_DIR:$clone_status" >> "$FAILED_REPOS_FILE"
+      echo "  ✗ $REPO_DIR (clone failed)"
+      echo "$REPO_DIR:$clone_status:clone" >> "$FAILED_REPOS_FILE"
       return 1
     fi
+
+    echo "  + $REPO_DIR (cloned)"
+    echo "clone" >> "$SUCCESS_FILE"
   fi
 
-  # Signal completion
-  echo "Completed processing $REPO_DIR"
   return 0
 }
 
@@ -153,69 +145,99 @@ wait_for_jobs() {
   done
 }
 
-# Fetch and clone all repositories
+# Clean up temp files
+rm -f "$FAILED_REPOS_FILE" "$SUCCESS_FILE"
+
+# Fetch and process all repositories
 while true; do
-  echo "-----------------------------------------"
-  echo "Fetching page $PAGE of repositories..."
   REPOS=$(fetch_repositories)
   REPO_NAMES=$(echo "$REPOS" | jq -r '.[].ssh_url')
 
   if [ -z "$REPO_NAMES" ] || [ "$REPO_NAMES" == "null" ]; then
-    echo "No more repositories found."
     break
   fi
 
   for REPO in $REPO_NAMES; do
-    # Get repository name
     repo_name=$(basename "$REPO" .git)
 
-    # Check if repository should be ignored
     if should_ignore "$repo_name"; then
-      echo "⏭️  Skipping ignored repository: $repo_name"
       SKIPPED_REPOS=$((SKIPPED_REPOS + 1))
       continue
     fi
 
-    # Wait if we've reached the maximum number of parallel jobs
     wait_for_jobs $MAX_PARALLEL_JOBS
-
-    # Process repository in background
     process_repository "$REPO" &
-
     TOTAL_REPOS=$((TOTAL_REPOS + 1))
   done
 
   PAGE=$((PAGE + 1))
 done
 
-# Wait for all remaining background jobs to complete
-echo "Waiting for all repositories to finish processing..."
 wait
 
-# Check for any failures
+# Count successes
+if [ -f "$SUCCESS_FILE" ]; then
+  SYNCED_REPOS=$(grep -c "pull" "$SUCCESS_FILE" 2>/dev/null || echo 0)
+  CLONED_REPOS=$(grep -c "clone" "$SUCCESS_FILE" 2>/dev/null || echo 0)
+  rm -f "$SUCCESS_FILE"
+fi
+
+# Collect failures
+declare -a DIRTY_REPOS
+declare -a OTHER_FAILURES
+
 if [ -f "$FAILED_REPOS_FILE" ]; then
-  while IFS=: read -r repo_name exit_code; do
-    FAILED_REPOS+=("$repo_name (exit code: $exit_code)")
+  while IFS=: read -r repo_name exit_code reason; do
+    if [[ "$reason" == "dirty" ]]; then
+      DIRTY_REPOS+=("$repo_name")
+    else
+      OTHER_FAILURES+=("$repo_name ($reason)")
+    fi
+    FAILED_REPOS+=("$repo_name")
   done < "$FAILED_REPOS_FILE"
   rm -f "$FAILED_REPOS_FILE"
 fi
 
-echo "-----------------------------------------"
-echo "All repositories have been cloned or updated."
-echo "Total repositories processed: $TOTAL_REPOS"
-if [ $SKIPPED_REPOS -gt 0 ]; then
-  echo "Skipped repositories (ignored): $SKIPPED_REPOS"
+# Summary
+echo ""
+echo "── done ─────────────────────────────────"
+echo "  $SYNCED_REPOS synced · $CLONED_REPOS cloned · ${#FAILED_REPOS[@]} failed · $SKIPPED_REPOS ignored"
+
+# Report non-dirty failures
+if [ ${#OTHER_FAILURES[@]} -gt 0 ]; then
+  echo ""
+  echo "  Failed (manual fix needed):"
+  for failed in "${OTHER_FAILURES[@]}"; do
+    echo "    ✗ $failed"
+  done
 fi
 
-# Report any failures
-if [ ${#FAILED_REPOS[@]} -gt 0 ]; then
+# Handle dirty repos interactively
+if [ ${#DIRTY_REPOS[@]} -gt 0 ]; then
   echo ""
-  echo "⚠️  WARNING: ${#FAILED_REPOS[@]} repository/repositories encountered errors:"
-  for failed in "${FAILED_REPOS[@]}"; do
-    echo "  ❌ $failed"
+  echo "  Failed (local changes):"
+  for repo in "${DIRTY_REPOS[@]}"; do
+    echo "    ✗ $repo"
   done
   echo ""
-  echo "Please manually fix the repositories listed above."
-else
-  echo "✅ All repositories processed successfully."
+  read -r -p "  Reset these ${#DIRTY_REPOS[@]} repo(s) with git reset --hard and retry? [y/N] " response
+  if [[ "$response" =~ ^[Yy]$ ]]; then
+    echo ""
+    for repo in "${DIRTY_REPOS[@]}"; do
+      cd "$repo" || continue
+      git reset --hard HEAD --quiet 2>/dev/null
+      git checkout main 2>/dev/null || git checkout master 2>/dev/null
+      if git pull --quiet 2>/dev/null; then
+        echo "  ✓ $repo (reset + pulled)"
+      else
+        echo "  ✗ $repo (still failing after reset)"
+      fi
+      cd ..
+    done
+  fi
+fi
+
+if [ ${#FAILED_REPOS[@]} -eq 0 ]; then
+  echo ""
+  echo "  ✓ All repos up to date."
 fi
