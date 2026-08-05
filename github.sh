@@ -13,7 +13,12 @@ if [ -z "$GITHUB_TOKEN" ]; then
 fi
 
 # Parse arguments
-ORG=$1
+# Strip surrounding whitespace and any leading/trailing slashes (e.g. "aspyn-io/")
+ORG=$(echo "$1" | sed -E 's#^[[:space:]/]+|[[:space:]/]+$##g')
+if [ -z "$ORG" ]; then
+  echo "Error: invalid organization name '$1'."
+  exit 1
+fi
 VERBOSE=false
 if [[ "$2" == "-v" || "$2" == "--verbose" ]]; then
   VERBOSE=true
