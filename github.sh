@@ -156,6 +156,14 @@ rm -f "$FAILED_REPOS_FILE" "$SUCCESS_FILE"
 # Fetch and process all repositories
 while true; do
   REPOS=$(fetch_repositories)
+
+  if ! echo "$REPOS" | jq -e 'type == "array"' &> /dev/null; then
+    API_MESSAGE=$(echo "$REPOS" | jq -r '.message // "unexpected API response"')
+    echo "Error: GitHub API request failed for org '$ORG': $API_MESSAGE"
+    echo "Check that the organization name is correct and that GITHUB_TOKEN has access to it."
+    exit 1
+  fi
+
   REPO_NAMES=$(echo "$REPOS" | jq -r '.[].ssh_url')
 
   if [ -z "$REPO_NAMES" ] || [ "$REPO_NAMES" == "null" ]; then
