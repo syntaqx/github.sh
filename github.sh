@@ -36,6 +36,49 @@ MAX_PARALLEL_JOBS=${MAX_PARALLEL_JOBS:-5}
 declare -a FAILED_REPOS
 FAILED_REPOS_FILE="/tmp/github_failed_repos_$$.tmp"
 SUCCESS_FILE="/tmp/github_success_$$.tmp"
+PROGRESS_FILE="/tmp/github_progress_$$.tmp"
+COUNT_WIDTH=1
+
+# Colors — automatically disabled when stdout is not a terminal (e.g. piped)
+if [ -t 1 ]; then
+  BOLD=$'\e[1m'; DIM=$'\e[2m'; RESET=$'\e[0m'
+  RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'
+  BLUE=$'\e[34m'; MAGENTA=$'\e[35m'; CYAN=$'\e[36m'; GREY=$'\e[90m'
+else
+  BOLD=''; DIM=''; RESET=''
+  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; GREY=''
+fi
+
+# Braille spinner frames (array avoids multibyte substring pitfalls)
+SPINNER=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+
+# Print the ASCII banner
+print_banner() {
+  echo ""
+  printf '%s\n' \
+"${CYAN}   ____ _ _   ____                   ${RESET}" \
+"${CYAN}  / ___(_) |_/ ___| _   _ _ __   ___ ${RESET}" \
+"${CYAN} | |  _| | __\\___ \\| | | | '_ \\ / __|${RESET}" \
+"${CYAN} | |_| | | |_ ___) | |_| | | | | (__ ${RESET}" \
+"${CYAN}  \\____|_|\\__|____/ \\__, |_| |_|\\___|${RESET}" \
+"${CYAN}                    |___/            ${RESET}"
+  echo ""
+  printf "  ${BOLD}%s${RESET} ${DIM}→ %s${RESET}\n\n" "$ORG" "$(realpath "$PWD")"
+}
+
+# Print a per-repo status line prefixed with a live [done/total] counter
+print_status() {
+  local color=$1 symbol=$2 name=$3 note=$4 n
+  echo x >> "$PROGRESS_FILE"
+  n=$(wc -l < "$PROGRESS_FILE" 2>/dev/null); n=${n//[[:space:]]/}
+  if [ -n "$note" ]; then
+    printf "  ${GREY}[%*d/%d]${RESET} ${color}%s${RESET} %s ${DIM}%s${RESET}\n" \
+      "$COUNT_WIDTH" "$n" "$TOTAL_REPOS" "$symbol" "$name" "$note"
+  else
+    printf "  ${GREY}[%*d/%d]${RESET} ${color}%s${RESET} %s\n" \
+      "$COUNT_WIDTH" "$n" "$TOTAL_REPOS" "$symbol" "$name"
+  fi
+}
 
 # Repositories to ignore (add repository names here)
 declare -a IGNORE_LIST=(
@@ -49,8 +92,7 @@ declare -a IGNORE_LIST=(
 mkdir -p "$ORG_DIR"
 cd "$ORG_DIR" || { echo "Failed to change directory to $ORG_DIR"; exit 1; }
 
-echo "⟳  Syncing $ORG → $(realpath "$PWD")"
-echo ""
+print_banner
 
 # Function to fetch repositories from the GitHub API
 fetch_repositories() {
@@ -114,12 +156,12 @@ process_repository() {
       elif echo "$output" | grep -q "no such ref"; then
         reason="missing-ref"
       fi
-      echo "  ✗ $REPO_DIR"
+      print_status "$RED" "✗" "$REPO_DIR" "$reason"
       echo "$REPO_DIR:$pull_status:$reason" >> "$FAILED_REPOS_FILE"
       return 1
     fi
 
-    echo "  ✓ $REPO_DIR"
+    print_status "$GREEN" "✓" "$REPO_DIR"
     echo "pull" >> "$SUCCESS_FILE"
   else
     local output clone_status
@@ -127,12 +169,12 @@ process_repository() {
     clone_status=$?
 
     if [ $clone_status -ne 0 ]; then
-      echo "  ✗ $REPO_DIR (clone failed)"
+      print_status "$RED" "✗" "$REPO_DIR" "clone failed"
       echo "$REPO_DIR:$clone_status:clone" >> "$FAILED_REPOS_FILE"
       return 1
     fi
 
-    echo "  + $REPO_DIR (cloned)"
+    print_status "$CYAN" "+" "$REPO_DIR" "cloned"
     echo "clone" >> "$SUCCESS_FILE"
   fi
 
@@ -151,9 +193,12 @@ wait_for_jobs() {
 }
 
 # Clean up temp files
-rm -f "$FAILED_REPOS_FILE" "$SUCCESS_FILE"
+rm -f "$FAILED_REPOS_FILE" "$SUCCESS_FILE" "$PROGRESS_FILE"
 
-# Fetch and process all repositories
+# ── Phase 1: discover every repository up front ──────────────────────────
+declare -a ALL_REPOS=()
+spin_i=0
+
 while true; do
   REPOS=$(fetch_repositories)
   REPO_NAMES=$(echo "$REPOS" | jq -r '.[].ssh_url')
@@ -162,23 +207,50 @@ while true; do
     break
   fi
 
-  for REPO in $REPO_NAMES; do
-    repo_name=$(basename "$REPO" .git)
+  while IFS= read -r REPO; do
+    [ -z "$REPO" ] && continue
+    ALL_REPOS+=("$REPO")
+  done <<< "$REPO_NAMES"
 
-    if should_ignore "$repo_name"; then
-      SKIPPED_REPOS=$((SKIPPED_REPOS + 1))
-      continue
-    fi
-
-    wait_for_jobs $MAX_PARALLEL_JOBS
-    process_repository "$REPO" &
-    TOTAL_REPOS=$((TOTAL_REPOS + 1))
-  done
+  spin_i=$(( (spin_i + 1) % ${#SPINNER[@]} ))
+  printf "\r  ${CYAN}%s${RESET} Discovering repositories… ${DIM}(%d found)${RESET}" \
+    "${SPINNER[$spin_i]}" "${#ALL_REPOS[@]}"
 
   PAGE=$((PAGE + 1))
 done
 
+# Filter out ignored repos to build the work queue
+declare -a REPO_QUEUE=()
+for REPO in "${ALL_REPOS[@]}"; do
+  repo_name=$(basename "$REPO" .git)
+  if should_ignore "$repo_name"; then
+    SKIPPED_REPOS=$((SKIPPED_REPOS + 1))
+    continue
+  fi
+  REPO_QUEUE+=("$REPO")
+done
+
+TOTAL_REPOS=${#REPO_QUEUE[@]}
+COUNT_WIDTH=${#TOTAL_REPOS}
+
+printf "\r\033[K"
+printf "  ${BOLD}%d${RESET} repositories  ${DIM}·${RESET}  ${GREEN}%d to sync${RESET}  ${DIM}·${RESET}  ${YELLOW}%d ignored${RESET}\n\n" \
+  "${#ALL_REPOS[@]}" "$TOTAL_REPOS" "$SKIPPED_REPOS"
+
+if [ "$TOTAL_REPOS" -eq 0 ]; then
+  echo "  ${DIM}Nothing to sync.${RESET}"
+  rm -f "$PROGRESS_FILE"
+  exit 0
+fi
+
+# ── Phase 2: sync (parallel, with live [n/total] progress) ───────────────
+for REPO in "${REPO_QUEUE[@]}"; do
+  wait_for_jobs $MAX_PARALLEL_JOBS
+  process_repository "$REPO" &
+done
+
 wait
+rm -f "$PROGRESS_FILE"
 
 # Count successes
 if [ -f "$SUCCESS_FILE" ]; then
@@ -205,27 +277,28 @@ fi
 
 # Summary
 echo ""
-echo "── done ─────────────────────────────────"
-echo "  $SYNCED_REPOS synced · $CLONED_REPOS cloned · ${#FAILED_REPOS[@]} failed · $SKIPPED_REPOS ignored"
+printf "  ${DIM}%s${RESET}\n" "────────────────────────────────────────────"
+printf "  ${GREEN}✓ %d synced${RESET}   ${CYAN}+ %d cloned${RESET}   ${RED}✗ %d failed${RESET}   ${YELLOW}⊘ %d ignored${RESET}\n" \
+  "$SYNCED_REPOS" "$CLONED_REPOS" "${#FAILED_REPOS[@]}" "$SKIPPED_REPOS"
 
 # Report non-dirty failures
 if [ ${#OTHER_FAILURES[@]} -gt 0 ]; then
   echo ""
-  echo "  Failed (manual fix needed):"
+  printf "  ${BOLD}${RED}Failed${RESET} ${DIM}(manual fix needed)${RESET}\n"
   for failed in "${OTHER_FAILURES[@]}"; do
-    echo "    ✗ $failed"
+    printf "    ${RED}✗${RESET} %s\n" "$failed"
   done
 fi
 
 # Handle dirty repos interactively
 if [ ${#DIRTY_REPOS[@]} -gt 0 ]; then
   echo ""
-  echo "  Failed (local changes):"
+  printf "  ${BOLD}${YELLOW}Failed${RESET} ${DIM}(local changes)${RESET}\n"
   for repo in "${DIRTY_REPOS[@]}"; do
-    echo "    ✗ $repo"
+    printf "    ${YELLOW}✗${RESET} %s\n" "$repo"
   done
   echo ""
-  read -r -p "  Reset these ${#DIRTY_REPOS[@]} repo(s) with git reset --hard and retry? [y/N] " response
+  read -r -p "  ${BOLD}Reset these ${#DIRTY_REPOS[@]} repo(s) with git reset --hard and retry? [y/N]${RESET} " response
   if [[ "$response" =~ ^[Yy]$ ]]; then
     echo ""
     for repo in "${DIRTY_REPOS[@]}"; do
@@ -233,9 +306,9 @@ if [ ${#DIRTY_REPOS[@]} -gt 0 ]; then
       git reset --hard HEAD --quiet 2>/dev/null
       git checkout main 2>/dev/null || git checkout master 2>/dev/null
       if git pull --quiet 2>/dev/null; then
-        echo "  ✓ $repo (reset + pulled)"
+        printf "    ${GREEN}✓${RESET} %s ${DIM}(reset + pulled)${RESET}\n" "$repo"
       else
-        echo "  ✗ $repo (still failing after reset)"
+        printf "    ${RED}✗${RESET} %s ${DIM}(still failing after reset)${RESET}\n" "$repo"
       fi
       cd ..
     done
@@ -244,5 +317,5 @@ fi
 
 if [ ${#FAILED_REPOS[@]} -eq 0 ]; then
   echo ""
-  echo "  ✓ All repos up to date."
+  printf "  ${GREEN}✓ All repos up to date.${RESET}\n"
 fi
