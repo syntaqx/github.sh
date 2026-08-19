@@ -34,9 +34,7 @@ SYNCED_REPOS=0
 CLONED_REPOS=0
 MAX_PARALLEL_JOBS=${MAX_PARALLEL_JOBS:-5}
 declare -a FAILED_REPOS
-FAILED_REPOS_FILE="/tmp/github_failed_repos_$$.tmp"
-SUCCESS_FILE="/tmp/github_success_$$.tmp"
-PROGRESS_FILE="/tmp/github_progress_$$.tmp"
+RESULTS_FILE="/tmp/github_sync_$$.tmp"
 COUNT_WIDTH=1
 
 # Colors — automatically disabled when stdout is not a terminal (e.g. piped)
@@ -66,11 +64,13 @@ print_banner() {
   printf "  ${BOLD}%s${RESET} ${DIM}→ %s${RESET}\n\n" "$ORG" "$(realpath "$PWD")"
 }
 
-# Print a per-repo status line prefixed with a live [done/total] counter
-print_status() {
-  local color=$1 symbol=$2 name=$3 note=$4 n
-  echo x >> "$PROGRESS_FILE"
-  n=$(wc -l < "$PROGRESS_FILE" 2>/dev/null); n=${n//[[:space:]]/}
+# Record a repo result and print a live [done/total] status line.
+# Every job appends exactly one tab-separated line, so line count == progress.
+# Args: <result> <reason> <color> <symbol> <name> <note>
+report() {
+  local result=$1 reason=$2 color=$3 symbol=$4 name=$5 note=$6 n
+  printf '%s\t%s\t%s\n' "$result" "$name" "$reason" >> "$RESULTS_FILE"
+  n=$(wc -l < "$RESULTS_FILE" 2>/dev/null); n=${n//[[:space:]]/}
   if [ -n "$note" ]; then
     printf "  ${GREY}[%*d/%d]${RESET} ${color}%s${RESET} %s ${DIM}%s${RESET}\n" \
       "$COUNT_WIDTH" "$n" "$TOTAL_REPOS" "$symbol" "$name" "$note"
@@ -156,44 +156,37 @@ process_repository() {
       elif echo "$output" | grep -q "no such ref"; then
         reason="missing-ref"
       fi
-      print_status "$RED" "✗" "$REPO_DIR" "$reason"
-      echo "$REPO_DIR:$pull_status:$reason" >> "$FAILED_REPOS_FILE"
+      report fail "$reason" "$RED" "✗" "$REPO_DIR" "$reason"
       return 1
     fi
 
-    print_status "$GREEN" "✓" "$REPO_DIR"
-    echo "pull" >> "$SUCCESS_FILE"
+    report pull "" "$GREEN" "✓" "$REPO_DIR" ""
   else
     local output clone_status
     output=$(git clone --quiet "$REPO" 2>&1)
     clone_status=$?
 
     if [ $clone_status -ne 0 ]; then
-      print_status "$RED" "✗" "$REPO_DIR" "clone failed"
-      echo "$REPO_DIR:$clone_status:clone" >> "$FAILED_REPOS_FILE"
+      report fail "clone" "$RED" "✗" "$REPO_DIR" "clone failed"
       return 1
     fi
 
-    print_status "$CYAN" "+" "$REPO_DIR" "cloned"
-    echo "clone" >> "$SUCCESS_FILE"
+    report clone "" "$CYAN" "+" "$REPO_DIR" "cloned"
   fi
 
   return 0
 }
 
-# Function to wait for background jobs to complete
-wait_for_jobs() {
-  local max_jobs=$1
-  local job_count
-  job_count=$(jobs -r | wc -l)
-  while [ "$job_count" -ge "$max_jobs" ]; do
-    sleep 0.1
-    job_count=$(jobs -r | wc -l)
+# Block until a concurrency slot frees up. Uses `wait -n` on bash 4.3+ (blocks
+# until the next job finishes); falls back to light polling on older shells.
+wait_for_slot() {
+  while [ "$(jobs -r | wc -l)" -ge "$MAX_PARALLEL_JOBS" ]; do
+    wait -n 2>/dev/null || sleep 0.1
   done
 }
 
 # Clean up temp files
-rm -f "$FAILED_REPOS_FILE" "$SUCCESS_FILE" "$PROGRESS_FILE"
+rm -f "$RESULTS_FILE"
 
 # ── Phase 1: discover every repository up front ──────────────────────────
 declare -a ALL_REPOS=()
@@ -239,40 +232,36 @@ printf "  ${BOLD}%d${RESET} repositories  ${DIM}·${RESET}  ${GREEN}%d to sync${
 
 if [ "$TOTAL_REPOS" -eq 0 ]; then
   echo "  ${DIM}Nothing to sync.${RESET}"
-  rm -f "$PROGRESS_FILE"
+  rm -f "$RESULTS_FILE"
   exit 0
 fi
 
-# ── Phase 2: sync (parallel, with live [n/total] progress) ───────────────
+# ── Phase 2: sync (bounded concurrency, live [n/total] progress) ─────────
 for REPO in "${REPO_QUEUE[@]}"; do
-  wait_for_jobs $MAX_PARALLEL_JOBS
+  wait_for_slot
   process_repository "$REPO" &
 done
 
 wait
-rm -f "$PROGRESS_FILE"
 
-# Count successes
-if [ -f "$SUCCESS_FILE" ]; then
-  SYNCED_REPOS=$(grep -c "pull" "$SUCCESS_FILE" 2>/dev/null || echo 0)
-  CLONED_REPOS=$(grep -c "clone" "$SUCCESS_FILE" 2>/dev/null || echo 0)
-  rm -f "$SUCCESS_FILE"
-fi
-
-# Collect failures
-declare -a DIRTY_REPOS
-declare -a OTHER_FAILURES
-
-if [ -f "$FAILED_REPOS_FILE" ]; then
-  while IFS=: read -r repo_name exit_code reason; do
-    if [[ "$reason" == "dirty" ]]; then
-      DIRTY_REPOS+=("$repo_name")
-    else
-      OTHER_FAILURES+=("$repo_name ($reason)")
-    fi
-    FAILED_REPOS+=("$repo_name")
-  done < "$FAILED_REPOS_FILE"
-  rm -f "$FAILED_REPOS_FILE"
+# Tally results from the single results file (one tab-separated line per repo)
+declare -a DIRTY_REPOS OTHER_FAILURES
+if [ -f "$RESULTS_FILE" ]; then
+  while IFS=$'\t' read -r result name reason; do
+    case "$result" in
+      pull)  SYNCED_REPOS=$((SYNCED_REPOS + 1)) ;;
+      clone) CLONED_REPOS=$((CLONED_REPOS + 1)) ;;
+      fail)
+        FAILED_REPOS+=("$name")
+        if [[ "$reason" == "dirty" ]]; then
+          DIRTY_REPOS+=("$name")
+        else
+          OTHER_FAILURES+=("$name ($reason)")
+        fi
+        ;;
+    esac
+  done < "$RESULTS_FILE"
+  rm -f "$RESULTS_FILE"
 fi
 
 # Summary
